@@ -41,9 +41,10 @@ class LightGCN(nn.Module):
         d_mat = sp.diags(d_inv)
         norm_adj = d_mat.dot(adj_mat).dot(d_mat)
         
-        # 희소 텐서로 변환
+        # 희소 텐서로 변환 (수정된 부분)
         coo = norm_adj.tocoo()
-        indices = torch.LongTensor([coo.row, coo.col])
+        indices = np.array([coo.row, coo.col])
+        indices = torch.LongTensor(indices)
         values = torch.FloatTensor(coo.data)
         self.norm_adj = torch.sparse_coo_tensor(
             indices, values, torch.Size(norm_adj.shape)
@@ -187,8 +188,10 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
 
 def main():
     # 데이터 로드
-    train_data = np.load('ml-1m_clean/test_list.npy')
+    train_data = np.load('ml-1m_clean/train_list.npy')
+    valid_data = np.load('ml-1m_clean/valid_list.npy')
     test_data = np.load('ml-1m_clean/test_list.npy')
+    item_emb = np.load('ml-1m_clean/item_emb.npy')
     
     # 사용자와 아이템 수 계산
     num_users = int(np.max(train_data[:, 0])) + 1
@@ -213,50 +216,78 @@ def main():
     # 디바이스 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
+    print(f'데이터셋 크기:')
+    print(f'- 학습 데이터: {len(train_data)}')
+    print(f'- 검증 데이터: {len(valid_data)}')
+    print(f'- 테스트 데이터: {len(test_data)}')
+    print(f'- 아이템 임베딩: {item_emb.shape}')
+    print(f'학습 시작...\n')
     
     # 모델과 옵티마이저 초기화
     model = LightGCN(num_users, num_items, EMBEDDING_DIM, NUM_LAYERS).to(device)
+    
+    # 아이템 임베딩 초기화
+    with torch.no_grad():
+        model.item_embedding.weight.data.copy_(torch.FloatTensor(item_emb))
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
     # 데이터셋과 데이터로더 생성
     train_dataset = TrainDataset(train_data, user_train_dict, num_items)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     
+    print(f'인접 행렬 생성 중...')
     # 인접 행렬 생성
     model.create_adj_matrix(train_data)
+    print(f'인접 행렬 생성 완료\n')
     
     best_recall = 0
     best_epoch = 0
     
     for epoch in range(EPOCHS):
+        model.train()
         total_loss = 0
-        for users, pos_items, neg_items in train_loader:
+        print(f'에포크 {epoch+1}/{EPOCHS} 학습 중...')
+        
+        for batch_idx, (users, pos_items, neg_items) in enumerate(train_loader):
             users = users.to(device)
             pos_items = pos_items.to(device)
-            neg_items = neg_items.to(device)
+            neg_items = neg_items.to(device)  # shape: [batch_size, 4]
             
             loss = train_step(model, optimizer, users, pos_items, neg_items)
             total_loss += loss
+            
+            if (batch_idx + 1) % 100 == 0:
+                print(f'배치 {batch_idx+1}/{len(train_loader)}, 손실: {loss:.4f}')
         
         avg_loss = total_loss / len(train_loader)
         
         # 5 에포크마다 평가 수행
         if (epoch + 1) % 5 == 0:
-            print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
-            metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
-            print('평가 결과:')
-            for metric, value in metrics.items():
+            print(f'\n에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
+            
+            # 검증 데이터로 평가
+            print('검증 데이터로 평가 중...')
+            valid_metrics = calculate_metrics(model, valid_data, user_train_dict, num_items)
+            print('검증 결과:')
+            for metric, value in valid_metrics.items():
                 print(f'{metric}: {value:.4f}')
             
             # 최고 성능 모델 저장
-            if metrics['Recall@10'] > best_recall:
-                best_recall = metrics['Recall@10']
+            if valid_metrics['Recall@10'] > best_recall:
+                best_recall = valid_metrics['Recall@10']
                 best_epoch = epoch + 1
                 torch.save(model.state_dict(), 'lightgcn_model_best.pt')
+                print('최고 성능 모델 저장 완료')
+        print('\n')
     
     print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
     model.load_state_dict(torch.load('lightgcn_model_best.pt'))
+    
+    # 최종 테스트 데이터로 평가
+    print('테스트 데이터로 최종 평가 중...')
     final_metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
+    print('테스트 결과:')
     for metric, value in final_metrics.items():
         print(f'{metric}: {value:.4f}')
 
