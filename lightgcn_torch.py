@@ -41,7 +41,7 @@ class LightGCN(nn.Module):
         d_mat = sp.diags(d_inv)
         norm_adj = d_mat.dot(adj_mat).dot(d_mat)
         
-        # 희소 텐서로 변환 (수정된 부분)
+        # 희소 텐서로 변환
         coo = norm_adj.tocoo()
         indices = np.array([coo.row, coo.col])
         indices = torch.LongTensor(indices)
@@ -85,10 +85,19 @@ class LightGCN(nn.Module):
         return pos_score, users_emb_final, items_emb_final
 
 class TrainDataset(Dataset):
-    def __init__(self, train_data, user_items, num_items):
+    def __init__(self, train_data, user_items, num_items, num_negatives=4):
         self.train_data = train_data
         self.user_items = user_items
         self.num_items = num_items
+        self.num_negatives = num_negatives
+        
+        # 각 사용자별 인기도 기반 네거티브 샘플링을 위한 가중치 계산
+        self.item_popularity = np.zeros(num_items)
+        for user, items in user_items.items():
+            for item in items:
+                self.item_popularity[item] += 1
+        self.item_popularity = 1 / (self.item_popularity + 1)  # 인기도의 역수
+        self.item_popularity /= np.sum(self.item_popularity)  # 정규화
     
     def __len__(self):
         return len(self.train_data)
@@ -97,25 +106,42 @@ class TrainDataset(Dataset):
         user = int(self.train_data[idx][0])
         pos_item = int(self.train_data[idx][1])
         
-        # 네거티브 샘플링
-        while True:
-            neg_item = np.random.randint(0, self.num_items)
-            if neg_item not in self.user_items[user]:
-                break
+        # 다중 네거티브 샘플링
+        neg_items = []
+        user_pos_items = self.user_items[user]
         
-        return user, pos_item, neg_item
+        while len(neg_items) < self.num_negatives:
+            # 인기도를 고려한 네거티브 샘플링
+            if np.random.random() < 0.5:  # 50% 확률로 인기도 기반 샘플링
+                neg_item = np.random.choice(self.num_items, p=self.item_popularity)
+            else:  # 50% 확률로 완전 랜덤 샘플링
+                neg_item = np.random.randint(0, self.num_items)
+            
+            if neg_item not in user_pos_items and neg_item not in neg_items:
+                neg_items.append(neg_item)
+        
+        # 텐서로 변환
+        return (torch.tensor(user, dtype=torch.long),
+                torch.tensor(pos_item, dtype=torch.long),
+                torch.tensor(neg_items, dtype=torch.long))
 
 def train_step(model, optimizer, users, pos_items, neg_items):
     model.train()
     optimizer.zero_grad()
     
-    pos_score, neg_score, users_emb, items_emb = model(users, pos_items, neg_items)
+    batch_size = users.size(0)
+    users = users.repeat_interleave(4)  # 각 사용자를 4번 반복
+    pos_items = pos_items.repeat_interleave(4)  # 각 긍정적 아이템을 4번 반복
+    neg_items = neg_items.view(-1)  # [batch_size * 4]
     
-    # BPR 손실 계산
-    loss = -torch.mean(torch.log(torch.sigmoid(pos_score - neg_score)))
+    pos_scores, neg_scores, users_emb, items_emb = model(users, pos_items, neg_items)
+    
+    # BPR 손실 계산 (개선된 버전)
+    loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
     
     # L2 정규화
-    reg_loss = 1e-4 * (torch.mean(torch.square(users_emb)) + torch.mean(torch.square(items_emb)))
+    reg_loss = 1e-4 * (torch.mean(torch.square(users_emb)) + 
+                       torch.mean(torch.square(items_emb)))
     loss += reg_loss
     
     loss.backward()
@@ -233,8 +259,12 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
     # 데이터셋과 데이터로더 생성
-    train_dataset = TrainDataset(train_data, user_train_dict, num_items)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_dataset = TrainDataset(train_data, user_train_dict, num_items, num_negatives=4)
+    train_loader = DataLoader(train_dataset, 
+                            batch_size=BATCH_SIZE, 
+                            shuffle=True,
+                            num_workers=4,  # 데이터 로딩 속도 향상
+                            pin_memory=True)  # GPU 사용 시 성능 향상
     
     print(f'인접 행렬 생성 중...')
     # 인접 행렬 생성
@@ -252,7 +282,7 @@ def main():
         for batch_idx, (users, pos_items, neg_items) in enumerate(train_loader):
             users = users.to(device)
             pos_items = pos_items.to(device)
-            neg_items = neg_items.to(device)  # shape: [batch_size, 4]
+            neg_items = neg_items.to(device)
             
             loss = train_step(model, optimizer, users, pos_items, neg_items)
             total_loss += loss
@@ -262,7 +292,7 @@ def main():
         
         avg_loss = total_loss / len(train_loader)
         
-        # 5 에포크마다 평가 수행
+        
         if (epoch + 1) % 5 == 0:
             print(f'\n에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
             
