@@ -57,10 +57,11 @@ class LightGCN(nn.Module):
         all_emb = torch.cat([users_emb, items_emb])
         embs = [all_emb]
         
-        # 메시지 전파
+        # 메시지 전파 (가중치 추가)
+        layer_weights = [1.0, 0.9, 0.8]  # 각 레이어별 가중치
         for layer in range(self.num_layers):
             all_emb = torch.sparse.mm(self.norm_adj, all_emb)
-            embs.append(all_emb)
+            embs.append(all_emb * layer_weights[layer])
         
         # 다층 임베딩 결합
         embs = torch.stack(embs, dim=1)
@@ -111,10 +112,10 @@ class TrainDataset(Dataset):
         user_pos_items = self.user_items[user]
         
         while len(neg_items) < self.num_negatives:
-            # 인기도를 고려한 네거티브 샘플링
-            if np.random.random() < 0.5:  # 50% 확률로 인기도 기반 샘플링
+            # 인기도를 고려한 네거티브 샘플링 (비율 조정)
+            if np.random.random() < 0.7:  # 70% 확률로 인기도 기반 샘플링
                 neg_item = np.random.choice(self.num_items, p=self.item_popularity)
-            else:  # 50% 확률로 완전 랜덤 샘플링
+            else:  # 30% 확률로 완전 랜덤 샘플링
                 neg_item = np.random.randint(0, self.num_items)
             
             if neg_item not in user_pos_items and neg_item not in neg_items:
@@ -136,12 +137,13 @@ def train_step(model, optimizer, users, pos_items, neg_items):
     
     pos_scores, neg_scores, users_emb, items_emb = model(users, pos_items, neg_items)
     
-    # BPR 손실 계산 (개선된 버전)
-    loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
+    # BPR 손실 계산 (마진 추가)
+    margin = 1.0
+    loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores + margin)))
     
-    # L2 정규화
-    reg_loss = 1e-4 * (torch.mean(torch.square(users_emb)) + 
-                       torch.mean(torch.square(items_emb)))
+    # L2 정규화 강화
+    reg_loss = 5e-4 * (torch.mean(torch.square(users_emb)) + 
+                     torch.mean(torch.square(items_emb)))
     loss += reg_loss
     
     loss.backward()
@@ -238,6 +240,7 @@ def main():
     BATCH_SIZE = 1024
     EPOCHS = 50
     LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 1e-4  # L2 정규화를 위한 가중치 감쇠
     
     # 디바이스 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -256,18 +259,33 @@ def main():
     with torch.no_grad():
         model.item_embedding.weight.data.copy_(torch.FloatTensor(item_emb))
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Adam 옵티마이저 설정
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=WEIGHT_DECAY
+    )
+    
+    # 학습률 스케줄러 추가
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.7,    # 더 천천히 감소
+        patience=3,     # 더 빨리 반응
+        verbose=True
+    )
     
     # 데이터셋과 데이터로더 생성
     train_dataset = TrainDataset(train_data, user_train_dict, num_items, num_negatives=4)
     train_loader = DataLoader(train_dataset, 
                             batch_size=BATCH_SIZE, 
                             shuffle=True,
-                            num_workers=4,  # 데이터 로딩 속도 향상
-                            pin_memory=True)  # GPU 사용 시 성능 향상
+                            num_workers=4,
+                            pin_memory=True)
     
     print(f'인접 행렬 생성 중...')
-    # 인접 행렬 생성
     model.create_adj_matrix(train_data)
     print(f'인접 행렬 생성 완료\n')
     
@@ -292,7 +310,6 @@ def main():
         
         avg_loss = total_loss / len(train_loader)
         
-        
         if (epoch + 1) % 5 == 0:
             print(f'\n에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
             
@@ -303,16 +320,27 @@ def main():
             for metric, value in valid_metrics.items():
                 print(f'{metric}: {value:.4f}')
             
+            # 스케줄러 업데이트
+            scheduler.step(valid_metrics['Recall@10'])
+            
             # 최고 성능 모델 저장
             if valid_metrics['Recall@10'] > best_recall:
                 best_recall = valid_metrics['Recall@10']
                 best_epoch = epoch + 1
-                torch.save(model.state_dict(), 'lightgcn_model_best.pt')
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'best_recall': best_recall,
+                }, 'lightgcn_model_best.pt')
                 print('최고 성능 모델 저장 완료')
         print('\n')
     
     print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
-    model.load_state_dict(torch.load('lightgcn_model_best.pt'))
+    # 최고 성능 모델 로드
+    checkpoint = torch.load('lightgcn_model_best.pt')
+    model.load_state_dict(checkpoint['model_state_dict'])
     
     # 최종 테스트 데이터로 평가
     print('테스트 데이터로 최종 평가 중...')
