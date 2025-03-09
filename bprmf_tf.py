@@ -5,13 +5,16 @@ from tensorflow.keras.layers import Embedding
 import os
 
 class BPRMF(Model):
-    def __init__(self, num_users, num_items, embedding_dim=64):
+    def __init__(self, num_users, num_items, embedding_dim=64, item_embeddings=None):
         super(BPRMF, self).__init__()
         self.user_embedding = Embedding(num_users, embedding_dim,
                                      embeddings_initializer='random_normal',
                                      embeddings_regularizer=tf.keras.regularizers.l2(1e-6))
+        
+        # 아이템 임베딩 초기화
+        initializer = tf.keras.initializers.Constant(item_embeddings) if item_embeddings is not None else 'random_normal'
         self.item_embedding = Embedding(num_items, embedding_dim,
-                                     embeddings_initializer='random_normal',
+                                     embeddings_initializer=initializer,
                                      embeddings_regularizer=tf.keras.regularizers.l2(1e-6))
     
     def call(self, inputs):
@@ -28,7 +31,7 @@ class BPRMF(Model):
         
         return pos_score, neg_score
 
-def get_train_batch(train_data, user_items, num_items, batch_size):
+def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=5):
     num_samples = len(train_data)
     while True:
         # 랜덤하게 배치 인덱스 선택
@@ -37,17 +40,18 @@ def get_train_batch(train_data, user_items, num_items, batch_size):
             batch_indices = indices[i:i + batch_size]
             batch_data = train_data[batch_indices]
             
-            users = batch_data[:, 0]
-            pos_items = batch_data[:, 1]
+            users = np.repeat(batch_data[:, 0], num_neg)
+            pos_items = np.repeat(batch_data[:, 1], num_neg)
             neg_items = []
             
-            # 네거티브 샘플링
-            for user in users:
-                while True:
+            # 네거티브 샘플링 개선
+            for user in batch_data[:, 0]:
+                user_negs = []
+                while len(user_negs) < num_neg:
                     neg_item = np.random.randint(0, num_items)
-                    if neg_item not in user_items[user]:
-                        neg_items.append(neg_item)
-                        break
+                    if neg_item not in user_items[user] and neg_item not in user_negs:
+                        user_negs.append(neg_item)
+                neg_items.extend(user_negs)
             
             yield users, pos_items, neg_items
 
@@ -56,8 +60,13 @@ def train_step(model, optimizer, users, pos_items, neg_items):
     with tf.GradientTape() as tape:
         pos_score, neg_score = model((users, pos_items, neg_items))
         loss = -tf.reduce_mean(tf.math.log(tf.sigmoid(pos_score - neg_score)))
+        # L2 정규화 추가
+        l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in model.trainable_variables])
+        loss += 0.00001 * l2_loss
         
     gradients = tape.gradient(loss, model.trainable_variables)
+    # 그래디언트 클리핑 추가
+    gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
     return loss
 
@@ -129,6 +138,8 @@ def main():
     # 데이터 로드
     train_data = np.load('ml-1m_clean/train_list.npy')
     test_data = np.load('ml-1m_clean/test_list.npy')
+    item_emb = np.load('ml-1m_clean/item_emb.npy')
+    valid_data = np.load('ml-1m_clean/valid_list.npy')
     
     # 사용자와 아이템 수 계산
     num_users = int(np.max(train_data[:, 0])) + 1
@@ -143,22 +154,25 @@ def main():
             user_train_dict[user] = set()
         user_train_dict[user].add(item)
     
-    # 하이퍼파라미터 설정
-    EMBEDDING_DIM = 64
-    BATCH_SIZE = 1024
-    EPOCHS = 50
-    LEARNING_RATE = 0.001
+    # 하이퍼파라미터 수정
+    EMBEDDING_DIM = 64     # 임베딩 차원 유지
+    BATCH_SIZE = 256      # 배치 크기 더 감소
+    EPOCHS = 100          # 에포크 수 유지
+    LEARNING_RATE = 0.0001  # 학습률 더 감소
+    NUM_NEG = 8           # 네거티브 샘플 수 증가
     
     # 모델과 옵티마이저 초기화
-    model = BPRMF(num_users, num_items, EMBEDDING_DIM)
+    model = BPRMF(num_users, num_items, EMBEDDING_DIM, item_emb)
     optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
     
     # 학습
     num_batches = len(train_data) // BATCH_SIZE
-    train_generator = get_train_batch(train_data, user_train_dict, num_items, BATCH_SIZE)
+    train_generator = get_train_batch(train_data, user_train_dict, num_items, BATCH_SIZE, num_neg=NUM_NEG)
     
-    best_recall = 0
+    best_ndcg = 0
     best_epoch = 0
+    patience = 10  # Early stopping 용 patience
+    no_improve = 0
     
     for epoch in range(EPOCHS):
         total_loss = 0
@@ -173,19 +187,27 @@ def main():
         
         avg_loss = total_loss / num_batches
         
-        # 5 에포크마다 평가 수행
-        if (epoch + 1) % 5 == 0:
-            print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
-            metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
-            print('평가 결과:')
-            for metric, value in metrics.items():
-                print(f'{metric}: {value:.4f}')
+        # 매 에포크마다 평가 수행
+        metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
+        print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
+        print('평가 결과:')
+        for metric, value in metrics.items():
+            print(f'{metric}: {value:.4f}')
+        
+        # NDCG@20 기준으로 모델 저장
+        current_ndcg = metrics['NDCG@20']
+        if current_ndcg > best_ndcg:
+            best_ndcg = current_ndcg
+            best_epoch = epoch + 1
+            model.save_weights('bprmf_model_best.weights.h5')
+            no_improve = 0
+        else:
+            no_improve += 1
             
-            # 최고 성능 모델 저장
-            if metrics['Recall@10'] > best_recall:
-                best_recall = metrics['Recall@10']
-                best_epoch = epoch + 1
-                model.save_weights('bprmf_model_best.weights.h5')
+        # Early stopping
+        if no_improve >= patience:
+            print(f'Early stopping at epoch {epoch+1}')
+            break
     
     print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
     model.load_weights('bprmf_model_best.weights.h5')
