@@ -50,7 +50,7 @@ class BPRMF(Model):
         
         return pos_score, neg_score
 
-def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=5):
+def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=8):
     """
     학습용 미니배치 생성 제너레이터
     
@@ -195,13 +195,6 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
 def main():
     """
     BPRMF 모델의 학습과 평가를 위한 메인 함수
-    
-    프로세스:
-    1. 데이터 로드 및 전처리
-    2. 모델과 옵티마이저 초기화
-    3. 배치 단위 학습 수행
-    4. 검증 데이터로 성능 평가
-    5. 최종 테스트 평가
     """
     # 데이터 로드
     train_data = np.load('ml-1m_clean/train_list.npy')
@@ -228,6 +221,7 @@ def main():
     EPOCHS = 100          
     LEARNING_RATE = 0.0001
     NUM_NEG = 8           
+    EVAL_EVERY = 10       # 10 에포크마다 평가
     
     # 모델과 옵티마이저 초기화
     model = BPRMF(num_users, num_items, EMBEDDING_DIM, item_emb)
@@ -237,9 +231,9 @@ def main():
     num_batches = len(train_data) // BATCH_SIZE
     train_generator = get_train_batch(train_data, user_train_dict, num_items, BATCH_SIZE, num_neg=NUM_NEG)
     
-    best_valid_metrics = 0
+    best_loss = float('inf')  # 최저 손실값 초기화
     best_epoch = 0
-    patience = 10
+    patience = 10  # 얼리 스토핑 인내심
     no_improve = 0
     
     # 학습 시작
@@ -255,31 +249,31 @@ def main():
             total_loss += loss
         
         avg_loss = total_loss / num_batches
-        
-        # 검증 데이터로 평가
-        valid_metrics = calculate_metrics(model, valid_data, user_train_dict, num_items)
         print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
-        print('검증 데이터 평가 결과:')
-        for metric, value in valid_metrics.items():
-            print(f'{metric}: {value:.4f}')
         
-        # NDCG@20 기준으로 모델 저장
-        current_valid_metrics = valid_metrics['NDCG@20']
-        if current_valid_metrics > best_valid_metrics:
-            best_valid_metrics = current_valid_metrics
+        # 평균 손실이 개선되었는지 확인
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             best_epoch = epoch + 1
             model.save_weights('bprmf_model_best.weights.h5')
             no_improve = 0
         else:
             no_improve += 1
-            
-        # Early stopping
+        
+        # 10 에포크마다 검증 데이터로 평가
+        if (epoch + 1) % EVAL_EVERY == 0:
+            valid_metrics = calculate_metrics(model, valid_data, user_train_dict, num_items)
+            print('검증 데이터 평가 결과:')
+            for metric, value in valid_metrics.items():
+                print(f'{metric}: {value:.4f}')
+        
+        # Early stopping 체크
         if no_improve >= patience:
-            print(f'검증 성능이 {patience}회 연속 개선되지 않아 {epoch+1}에포크에서 학습 중단')
+            print(f'손실이 {patience}회 연속으로 개선되지 않아 {epoch+1}에포크에서 학습을 중단합니다.')
             break
     
     # 최종 테스트
-    print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
+    print(f'\n최고 성능 모델 (에포크 {best_epoch}, 최저 손실: {best_loss:.4f}):')
     model.load_weights('bprmf_model_best.weights.h5')
     final_metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
     print('테스트 데이터 최종 평가 결과:')
