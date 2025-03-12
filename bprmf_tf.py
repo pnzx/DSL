@@ -5,6 +5,16 @@ from tensorflow.keras.layers import Embedding
 import os
 
 class BPRMF(Model):
+    """
+    Bayesian Personalized Ranking Matrix Factorization (BPRMF) 모델 구현
+    
+    Args:
+        num_users (int): 전체 사용자 수
+        num_items (int): 전체 아이템 수
+        embedding_dim (int): 임베딩 차원 수
+        item_embeddings (np.array, optional): 사전 학습된 아이템 임베딩
+    """
+    
     def __init__(self, num_users, num_items, embedding_dim=64, item_embeddings=None):
         super(BPRMF, self).__init__()
         self.user_embedding = Embedding(num_users, embedding_dim,
@@ -18,6 +28,15 @@ class BPRMF(Model):
                                      embeddings_regularizer=tf.keras.regularizers.l2(1e-6))
     
     def call(self, inputs):
+        """
+        모델의 순전파 수행
+        
+        Args:
+            inputs (tuple): (user, pos_item, neg_item) 배치 데이터
+        
+        Returns:
+            tuple: (pos_score, neg_score) 긍정/부정 아이템의 예측 점수
+        """
         user, pos_item, neg_item = inputs
         
         # 임베딩 추출
@@ -32,6 +51,19 @@ class BPRMF(Model):
         return pos_score, neg_score
 
 def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=5):
+    """
+    학습용 미니배치 생성 제너레이터
+    
+    Args:
+        train_data (np.array): 학습 데이터 (user_id, item_id)
+        user_items (dict): 사용자별 상호작용한 아이템 집합
+        num_items (int): 전체 아이템 수
+        batch_size (int): 배치 크기
+        num_neg (int): 각 positive 샘플당 생성할 negative 샘플 수
+    
+    Yields:
+        tuple: (users, pos_items, neg_items) 배치 데이터
+    """
     num_samples = len(train_data)
     while True:
         # 랜덤하게 배치 인덱스 선택
@@ -57,6 +89,19 @@ def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=5):
 
 @tf.function
 def train_step(model, optimizer, users, pos_items, neg_items):
+    """
+    단일 학습 스텝 수행
+    
+    Args:
+        model (BPRMF): 학습할 모델
+        optimizer (tf.keras.optimizers): 옵티마이저
+        users (tf.Tensor): 사용자 ID 배치
+        pos_items (tf.Tensor): 긍정적 아이템 ID 배치
+        neg_items (tf.Tensor): 부정적 아이템 ID 배치
+    
+    Returns:
+        float: 현재 배치의 손실값
+    """
     with tf.GradientTape() as tape:
         pos_score, neg_score = model((users, pos_items, neg_items))
         loss = -tf.reduce_mean(tf.math.log(tf.sigmoid(pos_score - neg_score)))
@@ -71,6 +116,19 @@ def train_step(model, optimizer, users, pos_items, neg_items):
     return loss
 
 def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 20]):
+    """
+    모델 성능 평가
+    
+    Args:
+        model (BPRMF): 평가할 모델
+        test_data (np.array): 테스트 데이터 (user_id, item_id)
+        user_train_dict (dict): 사용자별 학습 데이터의 아이템 집합
+        num_items (int): 전체 아이템 수
+        k_list (list): 평가할 top-k 값들의 리스트
+    
+    Returns:
+        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k')
+    """
     # 사용자별 테스트 아이템 딕셔너리 생성
     user_test_dict = {}
     for user_item in test_data:
@@ -135,11 +193,21 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
     return results
 
 def main():
+    """
+    BPRMF 모델의 학습과 평가를 위한 메인 함수
+    
+    프로세스:
+    1. 데이터 로드 및 전처리
+    2. 모델과 옵티마이저 초기화
+    3. 배치 단위 학습 수행
+    4. 검증 데이터로 성능 평가
+    5. 최종 테스트 평가
+    """
     # 데이터 로드
     train_data = np.load('ml-1m_clean/train_list.npy')
     test_data = np.load('ml-1m_clean/test_list.npy')
-    item_emb = np.load('ml-1m_clean/item_emb.npy')
     valid_data = np.load('ml-1m_clean/valid_list.npy')
+    item_emb = np.load('ml-1m_clean/item_emb.npy')
     
     # 사용자와 아이템 수 계산
     num_users = int(np.max(train_data[:, 0])) + 1
@@ -154,26 +222,27 @@ def main():
             user_train_dict[user] = set()
         user_train_dict[user].add(item)
     
-    # 하이퍼파라미터 수정
-    EMBEDDING_DIM = 64     # 임베딩 차원 유지
-    BATCH_SIZE = 256      # 배치 크기 더 감소
-    EPOCHS = 100          # 에포크 수 유지
-    LEARNING_RATE = 0.0001  # 학습률 더 감소
-    NUM_NEG = 8           # 네거티브 샘플 수 증가
+    # 하이퍼파라미터 설정
+    EMBEDDING_DIM = 64     
+    BATCH_SIZE = 256      
+    EPOCHS = 100          
+    LEARNING_RATE = 0.0001
+    NUM_NEG = 8           
     
     # 모델과 옵티마이저 초기화
     model = BPRMF(num_users, num_items, EMBEDDING_DIM, item_emb)
     optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
     
-    # 학습
+    # 학습 준비
     num_batches = len(train_data) // BATCH_SIZE
     train_generator = get_train_batch(train_data, user_train_dict, num_items, BATCH_SIZE, num_neg=NUM_NEG)
     
-    best_ndcg = 0
+    best_valid_metrics = 0
     best_epoch = 0
-    patience = 10  # Early stopping 용 patience
+    patience = 10
     no_improve = 0
     
+    # 학습 시작
     for epoch in range(EPOCHS):
         total_loss = 0
         for _ in range(num_batches):
@@ -187,17 +256,17 @@ def main():
         
         avg_loss = total_loss / num_batches
         
-        # 매 에포크마다 평가 수행
-        metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
+        # 검증 데이터로 평가
+        valid_metrics = calculate_metrics(model, valid_data, user_train_dict, num_items)
         print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
-        print('평가 결과:')
-        for metric, value in metrics.items():
+        print('검증 데이터 평가 결과:')
+        for metric, value in valid_metrics.items():
             print(f'{metric}: {value:.4f}')
         
         # NDCG@20 기준으로 모델 저장
-        current_ndcg = metrics['NDCG@20']
-        if current_ndcg > best_ndcg:
-            best_ndcg = current_ndcg
+        current_valid_metrics = valid_metrics['NDCG@20']
+        if current_valid_metrics > best_valid_metrics:
+            best_valid_metrics = current_valid_metrics
             best_epoch = epoch + 1
             model.save_weights('bprmf_model_best.weights.h5')
             no_improve = 0
@@ -206,12 +275,14 @@ def main():
             
         # Early stopping
         if no_improve >= patience:
-            print(f'Early stopping at epoch {epoch+1}')
+            print(f'검증 성능이 {patience}회 연속 개선되지 않아 {epoch+1}에포크에서 학습 중단')
             break
     
+    # 최종 테스트
     print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
     model.load_weights('bprmf_model_best.weights.h5')
     final_metrics = calculate_metrics(model, test_data, user_train_dict, num_items)
+    print('테스트 데이터 최종 평가 결과:')
     for metric, value in final_metrics.items():
         print(f'{metric}: {value:.4f}')
 

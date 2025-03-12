@@ -6,6 +6,16 @@ import scipy.sparse as sp
 import os
 
 class LightGCN(Model):
+    """
+    LightGCN 추천 모델 클래스
+    
+    Args:
+        num_users (int): 전체 사용자 수
+        num_items (int): 전체 아이템 수
+        embedding_dim (int): 임베딩 차원 수
+        num_layers (int): GCN 레이어 수
+        item_embeddings (np.array, optional): 사전 학습된 아이템 임베딩
+    """
     def __init__(self, num_users, num_items, embedding_dim=64, num_layers=3, item_embeddings=None):
         super(LightGCN, self).__init__()
         self.num_users = num_users
@@ -34,6 +44,15 @@ class LightGCN(Model):
         self.built = True
     
     def light_gcn_propagate(self, adj_matrix):
+        """
+        LightGCN의 메시지 전파를 수행합니다.
+        
+        Args:
+            adj_matrix (tf.sparse.SparseTensor): 정규화된 인접 행렬
+        
+        Returns:
+            tuple: (user_embeddings, item_embeddings) 최종 임베딩
+        """
         # 초기 임베딩 가져오기
         users_emb = tf.nn.embedding_lookup(self.user_embedding.embeddings, tf.range(self.num_users))
         items_emb = tf.nn.embedding_lookup(self.item_embedding.embeddings, tf.range(self.num_items))
@@ -59,6 +78,16 @@ class LightGCN(Model):
         return users, items
     
     def call(self, inputs, adj_matrix):
+        """
+        모델의 순전파를 수행합니다.
+        
+        Args:
+            inputs (tuple): (users, pos_items, neg_items) 배치 데이터
+            adj_matrix (tf.sparse.SparseTensor): 정규화된 인접 행렬
+        
+        Returns:
+            tuple: (positive_scores, negative_scores, user_embeddings, item_embeddings)
+        """
         users, pos_items, neg_items = inputs
         
         # LightGCN 전파
@@ -76,6 +105,17 @@ class LightGCN(Model):
         return pos_scores, neg_scores, user_emb, item_emb
 
 def create_adj_matrix(train_data, num_users, num_items):
+    """
+    사용자-아이템 상호작용 데이터로부터 정규화된 인접 행렬을 생성합니다.
+    
+    Args:
+        train_data (np.array): 사용자-아이템 상호작용 데이터 (user_id, item_id)
+        num_users (int): 전체 사용자 수
+        num_items (int): 전체 아이템 수
+    
+    Returns:
+        tf.sparse.SparseTensor: 정규화된 인접 행렬
+    """
     # 희소 행렬 생성
     adj = sp.dok_matrix((num_users + num_items, num_users + num_items), dtype=np.float32)
     
@@ -104,6 +144,19 @@ def create_adj_matrix(train_data, num_users, num_items):
     )
 
 def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=16):
+    """
+    학습을 위한 미니배치를 생성하는 제너레이터 함수입니다.
+    
+    Args:
+        train_data (np.array): 학습 데이터 (user_id, item_id)
+        user_items (dict): 사용자별 상호작용한 아이템 집합
+        num_items (int): 전체 아이템 수
+        batch_size (int): 배치 크기
+        num_neg (int): 각 positive 샘플당 생성할 negative 샘플 수
+    
+    Yields:
+        tuple: (users, positive_items, negative_items) 배치 데이터
+    """
     num_samples = len(train_data)
     # 아이템 인기도 계산
     item_popularity = np.zeros(num_items)
@@ -142,6 +195,20 @@ def get_train_batch(train_data, user_items, num_items, batch_size, num_neg=16):
 
 @tf.function
 def train_step(model, optimizer, users, pos_items, neg_items, adj_matrix):
+    """
+    한 번의 학습 스텝을 수행합니다.
+    
+    Args:
+        model (LightGCN): 학습할 모델
+        optimizer (tf.keras.optimizers): 옵티마이저
+        users (tf.Tensor): 사용자 ID 배치
+        pos_items (tf.Tensor): 긍정적 아이템 ID 배치
+        neg_items (tf.Tensor): 부정적 아이템 ID 배치
+        adj_matrix (tf.sparse.SparseTensor): 정규화된 인접 행렬
+    
+    Returns:
+        float: 현재 배치의 손실값
+    """
     with tf.GradientTape() as tape:
         pos_scores, neg_scores, user_emb, item_emb = model((users, pos_items, neg_items), adj_matrix)
         
@@ -161,6 +228,20 @@ def train_step(model, optimizer, users, pos_items, neg_items, adj_matrix):
     return loss
 
 def evaluate(model, test_data, user_train_dict, adj_matrix, num_items, k_list=[10, 20]):
+    """
+    모델의 성능을 평가합니다.
+    
+    Args:
+        model (LightGCN): 평가할 모델
+        test_data (np.array): 테스트 데이터 (user_id, item_id)
+        user_train_dict (dict): 사용자별 학습 데이터의 아이템 집합
+        adj_matrix (tf.sparse.SparseTensor): 정규화된 인접 행렬
+        num_items (int): 전체 아이템 수
+        k_list (list): 평가할 top-k 값들의 리스트
+    
+    Returns:
+        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k')
+    """
     user_test_dict = {}
     for user_item in test_data:
         user = int(user_item[0])
@@ -218,17 +299,27 @@ def evaluate(model, test_data, user_train_dict, adj_matrix, num_items, k_list=[1
     return results
 
 def main():
-    # 데이터 로드
+    """
+    LightGCN 모델의 학습과 평가를 실행하는 메인 함수입니다.
+    
+    학습 과정:
+    1. 데이터 로드 및 전처리
+    2. 모델 초기화
+    3. 배치 단위 학습 수행
+    4. 주기적 성능 평가
+    5. 최종 테스트 평가
+    """
+    # 1. 데이터 준비
     train_data = np.load('ml-1m_clean/train_list.npy')
     test_data = np.load('ml-1m_clean/test_list.npy')
     valid_data = np.load('ml-1m_clean/valid_list.npy')
     item_emb = np.load('ml-1m_clean/item_emb.npy')
     
-    # 사용자와 아이템 수 계산
+    # 사용자/아이템 수 계산
     num_users = int(np.max(train_data[:, 0])) + 1
     num_items = int(np.max(train_data[:, 1])) + 1
     
-    # 사용자별 아이템 목록 생성
+    # 사용자별 아이템 기록
     user_train_dict = {}
     for user_item in train_data:
         user = int(user_item[0])
@@ -237,21 +328,21 @@ def main():
             user_train_dict[user] = set()
         user_train_dict[user].add(item)
     
-    # 인접 행렬 생성
+    # 그래프 생성
     adj_matrix = create_adj_matrix(train_data, num_users, num_items)
     
-    # 하이퍼파라미터 수정
+    # 2. 하이퍼파라미터 설정
     EMBEDDING_DIM = 64
-    NUM_LAYERS = 5  # 레이어 수 증가
-    BATCH_SIZE = 4096  # 배치 크기 증가
-    EPOCHS = 500  # 에포크 수 증가
-    LEARNING_RATE = 0.01  # 학습률 증가
-    NUM_NEG = 16  # 네거티브 샘플 수 증가
+    NUM_LAYERS = 5
+    BATCH_SIZE = 4096
+    EPOCHS = 500
+    LEARNING_RATE = 0.01
+    NUM_NEG = 16
     
-    # 모델과 옵티마이저 초기화
+    # 3. 모델 설정
     model = LightGCN(num_users, num_items, EMBEDDING_DIM, NUM_LAYERS, item_emb)
     
-    # 모델 빌드
+    # 모델 초기화
     dummy_inputs = (
         tf.zeros((1,), dtype=tf.int32),
         tf.zeros((1,), dtype=tf.int32),
@@ -260,7 +351,7 @@ def main():
     dummy_adj = tf.sparse.from_dense(tf.zeros((num_users + num_items, num_users + num_items)))
     _ = model((dummy_inputs), dummy_adj)
     
-    # 학습률 스케줄러 수정
+    # 학습률 스케줄러
     lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
         initial_learning_rate=LEARNING_RATE,
         first_decay_steps=1000,
@@ -274,15 +365,18 @@ def main():
         weight_decay=1e-4
     )
     
-    # 학습
+    # 4. 학습 준비
     num_batches = len(train_data) // BATCH_SIZE
     train_generator = get_train_batch(train_data, user_train_dict, num_items, BATCH_SIZE, num_neg=NUM_NEG)
     
-    best_ndcg = 0
+    # 학습 관련 변수들
+    best_loss = float('inf')
     best_epoch = 0
     patience = 20
     no_improve = 0
+    eval_interval = 10
     
+    # 5. 학습 시작
     for epoch in range(EPOCHS):
         total_loss = 0
         for _ in range(num_batches):
@@ -295,32 +389,34 @@ def main():
             total_loss += loss
         
         avg_loss = total_loss / num_batches
-        
-        # 평가
-        metrics = evaluate(model, test_data, user_train_dict, adj_matrix, num_items)
         print(f'에포크 {epoch+1}/{EPOCHS}, 평균 손실: {avg_loss:.4f}')
-        print('평가 결과:')
-        for metric, value in metrics.items():
-            print(f'{metric}: {value:.4f}')
         
         # 모델 저장
-        current_ndcg = metrics['NDCG@20']
-        if current_ndcg > best_ndcg:
-            best_ndcg = current_ndcg
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             best_epoch = epoch + 1
             model.save_weights('lightgcn_best.weights.h5')
             no_improve = 0
         else:
             no_improve += 1
         
+        # 주기적 성능 체크
+        if (epoch + 1) % eval_interval == 0:
+            valid_metrics = evaluate(model, valid_data, user_train_dict, adj_matrix, num_items)
+            print('검증 데이터 평가 결과:')
+            for metric, value in valid_metrics.items():
+                print(f'{metric}: {value:.4f}')
+        
+        # 조기 종료
         if no_improve >= patience:
-            print(f'Early stopping at epoch {epoch+1}')
+            print(f'손실이 {patience}회 연속으로 개선되지 않아 {epoch+1}에포크에서 학습을 중단합니다.')
             break
     
-    # 최종 평가
-    print(f'\n최고 성능 모델 (에포크 {best_epoch}):')
+    # 6. 최종 평가
+    print(f'\n최고 성능 모델 (에포크 {best_epoch}, 최저 손실: {best_loss:.4f}):')
     model.load_weights('lightgcn_best.weights.h5')
     final_metrics = evaluate(model, test_data, user_train_dict, adj_matrix, num_items)
+    print('테스트 데이터 최종 평가 결과:')
     for metric, value in final_metrics.items():
         print(f'{metric}: {value:.4f}')
 
