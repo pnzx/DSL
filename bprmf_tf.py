@@ -127,7 +127,7 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
         k_list (list): 평가할 top-k 값들의 리스트
     
     Returns:
-        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k', 'HitRate@k')
+        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k')
     """
     # 사용자별 테스트 아이템 딕셔너리 생성
     user_test_dict = {}
@@ -140,7 +140,6 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
     
     recalls = {k: [] for k in k_list}
     ndcgs = {k: [] for k in k_list}
-    hit_rates = {k: [] for k in k_list}
     
     # 각 사용자에 대해 평가
     for user in user_test_dict:
@@ -174,19 +173,25 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
             recall = len(top_k_items & test_items) / len(test_items)
             recalls[k].append(recall)
             
-            # Hit Rate@K: 상위 K개 안에 실제 본 아이템이 하나라도 있는지
-            hit_rate = 1.0 if len(top_k_items & test_items) > 0 else 0.0
-            hit_rates[k].append(hit_rate)
+            # NDCG@K: 순위 기반 평가
+            # 1. 실제 테스트 아이템들의 순위 찾기
+            test_item_ranks = []
+            for item in test_items:
+                rank = np.where(item_ranks == item)[0][0]
+                if rank < k:  # 상위 K개 안에 있는 경우만 고려
+                    test_item_ranks.append(rank + 1)  # 1-based ranking
             
-            # NDCG@K: 순위를 고려한 점수
+            # 2. DCG 계산 (순위가 낮을수록 높은 가중치)
             dcg = 0
+            for rank in test_item_ranks:
+                dcg += 1 / np.log2(rank + 1)  # log2(rank + 1)로 순위에 따른 가중치 부여
+            
+            # 3. IDCG 계산 (이상적인 순서: 모든 테스트 아이템이 상위에 있는 경우)
             idcg = 0
-            for i, item in enumerate(top_k_items):
-                if item in test_items:  # 해당 순위의 아이템이 실제로 본 아이템인 경우
-                    dcg += 1 / np.log2(i + 2)  # log2(i+2)로 순위에 따른 가중치 부여
-            # 이상적인 순서에서의 점수 계산
             for i in range(min(k, len(test_items))):
                 idcg += 1 / np.log2(i + 2)
+            
+            # 4. NDCG 계산
             ndcg = dcg / idcg if idcg > 0 else 0
             ndcgs[k].append(ndcg)
     
@@ -195,7 +200,6 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
     for k in k_list:
         results[f'Recall@{k}'] = np.mean(recalls[k])
         results[f'NDCG@{k}'] = np.mean(ndcgs[k])
-        results[f'HitRate@{k}'] = np.mean(hit_rates[k])
     
     return results
 
