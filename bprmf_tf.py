@@ -117,7 +117,7 @@ def train_step(model, optimizer, users, pos_items, neg_items):
 
 def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 20]):
     """
-    모델 성능 평가
+    순위 기반 모델 성능 평가
     
     Args:
         model (BPRMF): 평가할 모델
@@ -127,7 +127,7 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
         k_list (list): 평가할 top-k 값들의 리스트
     
     Returns:
-        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k')
+        dict: 각 평가 지표의 결과값 ('Recall@k', 'NDCG@k', 'HitRate@k')
     """
     # 사용자별 테스트 아이템 딕셔너리 생성
     user_test_dict = {}
@@ -140,45 +140,51 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
     
     recalls = {k: [] for k in k_list}
     ndcgs = {k: [] for k in k_list}
+    hit_rates = {k: [] for k in k_list}
     
     # 각 사용자에 대해 평가
     for user in user_test_dict:
         if user not in user_train_dict or len(user_test_dict[user]) == 0:
             continue
             
-        # 모든 아이템에 대한 점수 계산
+        # 모든 아이템에 대한 예측 점수 계산
         user_input = tf.convert_to_tensor([user] * num_items, dtype=tf.int32)
         item_input = tf.convert_to_tensor(range(num_items), dtype=tf.int32)
         
-        # 임베딩 추출
         user_emb = model.user_embedding(user_input)
         item_emb = model.item_embedding(item_input)
-        
-        # 점수 계산
         scores = tf.reduce_sum(user_emb * item_emb, axis=1)
         
-        # 학습 데이터에 있는 아이템은 제외
+        # 학습 데이터의 아이템은 제외 (이미 본 아이템)
         scores = scores.numpy()
         scores[list(user_train_dict[user])] = float('-inf')
         
-        # Top-K 아이템 추출
-        max_k = max(k_list)
-        top_items = np.argsort(scores)[-max_k:][::-1]
+        # 전체 아이템에 대한 순위 계산
+        item_ranks = np.argsort(scores)[::-1]  # 점수 높은 순으로 정렬
         
-        # 지표 계산
+        # 테스트 아이템들의 순위 찾기
         test_items = user_test_dict[user]
+        max_k = max(k_list)
+        top_items = item_ranks[:max_k]
+        
         for k in k_list:
-            top_k_items = set(top_items[:k])
-            # Recall@K
+            top_k_items = set(item_ranks[:k])
+            
+            # Recall@K: 실제 본 아이템 중 상위 K개 안에 있는 비율
             recall = len(top_k_items & test_items) / len(test_items)
             recalls[k].append(recall)
             
-            # NDCG@K
+            # Hit Rate@K: 상위 K개 안에 실제 본 아이템이 하나라도 있는지
+            hit_rate = 1.0 if len(top_k_items & test_items) > 0 else 0.0
+            hit_rates[k].append(hit_rate)
+            
+            # NDCG@K: 순위를 고려한 점수
             dcg = 0
             idcg = 0
             for i, item in enumerate(top_k_items):
-                if item in test_items:
-                    dcg += 1 / np.log2(i + 2)
+                if item in test_items:  # 해당 순위의 아이템이 실제로 본 아이템인 경우
+                    dcg += 1 / np.log2(i + 2)  # log2(i+2)로 순위에 따른 가중치 부여
+            # 이상적인 순서에서의 점수 계산
             for i in range(min(k, len(test_items))):
                 idcg += 1 / np.log2(i + 2)
             ndcg = dcg / idcg if idcg > 0 else 0
@@ -189,6 +195,7 @@ def calculate_metrics(model, test_data, user_train_dict, num_items, k_list=[10, 
     for k in k_list:
         results[f'Recall@{k}'] = np.mean(recalls[k])
         results[f'NDCG@{k}'] = np.mean(ndcgs[k])
+        results[f'HitRate@{k}'] = np.mean(hit_rates[k])
     
     return results
 
